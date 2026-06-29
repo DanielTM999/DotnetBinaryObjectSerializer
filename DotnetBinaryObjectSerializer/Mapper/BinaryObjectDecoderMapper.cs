@@ -1,14 +1,12 @@
-using System;
 using System.Collections;
-using System.Collections.Generic;
 using System.Globalization;
-using System.IO;
 using System.Numerics;
 using System.Text;
 using DotnetBinaryObjectSerializer.Enums;
 using DotnetBinaryObjectSerializer.Exceptions;
 using DotnetBinaryObjectSerializer.Extensions;
 using DotnetBinaryObjectSerializer.Mapper.Models;
+
 
 namespace DotnetBinaryObjectSerializer.Mapper
 {
@@ -187,7 +185,7 @@ namespace DotnetBinaryObjectSerializer.Mapper
             }
         }
 
-        private object ConvertNode(Type type, IBinaryObjectNode node)
+        private object? ConvertNode(Type type, IBinaryObjectNode node)
         {
             if (node.ObjectType == ObjectType.Null)
                 return type.IsValueType ? Activator.CreateInstance(type) : null;
@@ -210,7 +208,7 @@ namespace DotnetBinaryObjectSerializer.Mapper
             return ConvertObject(type, node);
         }
 
-        private object ConvertDynamic(IBinaryObjectNode node)
+        private object? ConvertDynamic(IBinaryObjectNode node)
         {
             switch (node.ObjectType)
             {
