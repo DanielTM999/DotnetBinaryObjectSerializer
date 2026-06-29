@@ -1,0 +1,7 @@
+# .NET / Orion IDE
+bin/
+obj/
+.vs/
+.orion/
+*.user
+packages/
