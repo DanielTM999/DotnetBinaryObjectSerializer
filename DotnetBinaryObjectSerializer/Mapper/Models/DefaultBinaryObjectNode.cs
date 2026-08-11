@@ -14,6 +14,7 @@ namespace DotnetBinaryObjectSerializer.Mapper.Models
         private byte[] _sourceBytes;
         private int _sourceOffset;
         private int _sourceLength;
+        private StreamContent? _streamContent;
 
         private readonly List<IBinaryObjectNode> _children = new();
         private Dictionary<string, IBinaryObjectNode> _childrenByName;
@@ -25,6 +26,7 @@ namespace DotnetBinaryObjectSerializer.Mapper.Models
 
         public ObjectType ObjectType { get; private set; }
         public string Name { get; private set; }
+        public long BodyLength => _streamContent?.Length ?? ValueLength();
 
         public IList<IBinaryObjectNode> Children => _children;
 
@@ -101,6 +103,31 @@ namespace DotnetBinaryObjectSerializer.Mapper.Models
         }
 
         public byte[] AsBytes() => MaterializedBytes();
+
+        public Stream OpenStream()
+        {
+            if (_streamContent != null) return _streamContent.OpenStream();
+            if (ObjectType == ObjectType.LargeContent || ObjectType == ObjectType.Bytes)
+                return AsStreamContent().OpenStream();
+            var bytes = MaterializedBytes();
+            return new MemoryStream(bytes, writable: false);
+        }
+
+        public StreamContent AsStreamContent()
+        {
+            if (ObjectType != ObjectType.LargeContent && ObjectType != ObjectType.Bytes)
+                throw new DecodeSerializationException($"Node '{Name}' is not LARGE_CONTENT/BYTES, but {ObjectType}");
+            if (_streamContent != null) return _streamContent;
+            return _bytesValue != null
+                ? StreamLazy.Wrap(_bytesValue)
+                : StreamLazy.Wrap(_sourceBytes ?? Array.Empty<byte>(), _sourceOffset, _sourceLength);
+        }
+
+        public void Dispose()
+        {
+            foreach (var child in _children) child.Dispose();
+            _streamContent?.Dispose();
+        }
 
         public float AsFloat()
         {
@@ -189,6 +216,9 @@ namespace DotnetBinaryObjectSerializer.Mapper.Models
                     case ObjectType.Bytes:
                         map[node.Name] = node.AsBytes();
                         break;
+                    case ObjectType.LargeContent:
+                        map[node.Name] = node.AsStreamContent();
+                        break;
                     case ObjectType.List:
                         map[node.Name] = node.AsCollection<List<object>, object>();
                         break;
@@ -219,10 +249,20 @@ namespace DotnetBinaryObjectSerializer.Mapper.Models
 
         internal void SetBytesValue(byte[] sourceBytes, int sourceOffset, int sourceLength)
         {
+            _streamContent = null;
             _bytesValue = null;
             _sourceBytes = sourceBytes;
             _sourceOffset = sourceOffset;
             _sourceLength = sourceLength;
+        }
+
+        internal void SetStreamContent(StreamContent content)
+        {
+            _streamContent = content;
+            _bytesValue = null;
+            _sourceBytes = null;
+            _sourceOffset = 0;
+            _sourceLength = 0;
         }
 
         internal void AddChild(IBinaryObjectNode child)
@@ -305,6 +345,20 @@ namespace DotnetBinaryObjectSerializer.Mapper.Models
 
         private byte[] MaterializedBytes()
         {
+            if (_streamContent != null)
+            {
+                if (_streamContent.Length > int.MaxValue) throw new DecodeSerializationException("Content is too large for byte[]");
+                using var stream = _streamContent.OpenStream();
+                _bytesValue = new byte[(int)_streamContent.Length];
+                var read = 0;
+                while (read < _bytesValue.Length)
+                {
+                    var current = stream.Read(_bytesValue, read, _bytesValue.Length - read);
+                    if (current == 0) throw new DecodeSerializationException("LARGE_CONTENT stream ended early");
+                    read += current;
+                }
+                return _bytesValue;
+            }
             if (_bytesValue == null)
             {
                 if (_sourceBytes == null)

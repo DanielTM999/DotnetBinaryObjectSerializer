@@ -25,6 +25,7 @@ namespace DotnetBinaryObjectSerializer.Extensions
                 0x10 => ObjectType.Bytes,
                 0x11 => ObjectType.List,
                 0x12 => ObjectType.Null,
+                0x13 => ObjectType.LargeContent,
                 _ => null
             };
         }

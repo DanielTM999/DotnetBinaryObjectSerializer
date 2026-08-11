@@ -3,10 +3,11 @@ using DotnetBinaryObjectSerializer.Enums;
 
 namespace DotnetBinaryObjectSerializer
 {
-    public interface IBinaryObjectNode
+    public interface IBinaryObjectNode : IDisposable
     {
         ObjectType ObjectType { get; }
         string Name { get; }
+        long BodyLength { get; }
 
         IList<IBinaryObjectNode> Children { get; }
 
@@ -18,6 +19,8 @@ namespace DotnetBinaryObjectSerializer
         int? AsInt();
         bool? AsBoolean();
         byte[] AsBytes();
+        Stream OpenStream();
+        StreamContent AsStreamContent();
         float AsFloat();
         double AsDouble();
 

@@ -87,6 +87,13 @@ namespace DotnetBinaryObjectSerializer.Mapper
                 {
                     if (ShouldIgnoreField(field, phase)) continue;
 
+                    var largeContent = field.GetCustomAttribute<LargeContent>() != null;
+                    if (largeContent && !typeof(StreamContent).IsAssignableFrom(field.FieldType))
+                        throw new SerializationException($"[LargeContent] field '{field.Name}' must be StreamContent or a subclass");
+                    if (!largeContent && typeof(StreamContent).IsAssignableFrom(field.FieldType)
+                        && !typeof(StreamLazy).IsAssignableFrom(field.FieldType))
+                        throw new SerializationException($"StreamContent field '{field.Name}' must be marked with [LargeContent] or declared as StreamLazy");
+
                     var elementName = GetNameByElement(field);
                     fields.Add(new FieldCacheProps(
                         current,

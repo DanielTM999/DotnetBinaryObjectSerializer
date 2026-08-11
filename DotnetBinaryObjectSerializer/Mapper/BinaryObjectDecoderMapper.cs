@@ -12,7 +12,9 @@ namespace DotnetBinaryObjectSerializer.Mapper
 {
     public class BinaryObjectDecoderMapper : BinaryObjectEncoderMapper, IBinaryObjectDecoder
     {
-        public IBinaryObjectNode ReadAsTree(byte[] bytes)
+        public IBinaryObjectNode ReadAsTree(byte[] bytes) => ReadAsTree(bytes, DecodeOptions.Default);
+
+        public IBinaryObjectNode ReadAsTree(byte[] bytes, DecodeOptions options)
         {
             if (bytes == null) throw new DecodeSerializationException("bytes is null");
 
@@ -33,7 +35,7 @@ namespace DotnetBinaryObjectSerializer.Mapper
                     throw new DecodeSerializationException(
                         $"Protocol corrupted: payload incomplete, expected {payloadSize} bytes");
 
-                ReadNode(input, root, payloadEnd);
+                ReadNode(input, root, payloadEnd, options?.DeserializeOnDemand == true, options);
 
                 if (input.Position < payloadEnd)
                     throw new DecodeSerializationException(
@@ -51,11 +53,13 @@ namespace DotnetBinaryObjectSerializer.Mapper
             }
         }
 
-        public IBinaryObjectNode ReadAsTree(FileInfo file)
+        public IBinaryObjectNode ReadAsTree(FileInfo file) => ReadAsTree(file, DecodeOptions.Default);
+
+        public IBinaryObjectNode ReadAsTree(FileInfo file, DecodeOptions options)
         {
             try
             {
-                return ReadAsTree(File.ReadAllBytes(file.FullName));
+                return ReadAsTree(File.ReadAllBytes(file.FullName), options);
             }
             catch (IOException e)
             {
@@ -63,11 +67,23 @@ namespace DotnetBinaryObjectSerializer.Mapper
             }
         }
 
-        public IBinaryObjectNode ReadAsTree(Stream stream)
+        public IBinaryObjectNode ReadAsTree(Stream stream) => ReadAsTree(stream, DecodeOptions.Default);
+
+        public IBinaryObjectNode ReadAsTree(Stream stream, DecodeOptions options)
         {
+            if (stream == null) throw new DecodeSerializationException("stream is null");
             try
             {
-                return ReadAsTree(ReadFrame(stream));
+                var input = new BinaryInput(stream);
+                ValidateValidatorByte(input);
+                ValidateVersion(input);
+                var payloadSize = input.ReadPayloadLength();
+                if (payloadSize < 0 || payloadSize > int.MaxValue) throw new DecodeSerializationException("Invalid payload size: " + payloadSize);
+                var root = NewNode();
+                var end = checked(input.Position + (int)payloadSize);
+                ReadNode(input, root, end, options?.DeserializeOnDemand == true, options);
+                if (input.Position != end) throw new DecodeSerializationException("Invalid serialization: extra bytes after root node");
+                return root;
             }
             catch (IOException e)
             {
@@ -75,9 +91,16 @@ namespace DotnetBinaryObjectSerializer.Mapper
             }
         }
 
+        public IBinaryObjectNode ReadAsTreeWithOptions(byte[] bytes, DecodeOptions options) => ReadAsTree(bytes, options);
+        public IBinaryObjectNode ReadAsTreeWithOptions(FileInfo file, DecodeOptions options) => ReadAsTree(file, options);
+        public IBinaryObjectNode ReadAsTreeWithOptions(Stream stream, DecodeOptions options) => ReadAsTree(stream, options);
+
         public T ReadAsObject<T>(byte[] bytes) => (T)ConvertNode(typeof(T), ReadAsTree(bytes));
         public T ReadAsObject<T>(FileInfo file) => (T)ConvertNode(typeof(T), ReadAsTree(file));
         public T ReadAsObject<T>(Stream stream) => (T)ConvertNode(typeof(T), ReadAsTree(stream));
+        public T ReadAsObject<T>(byte[] bytes, DecodeOptions options) => (T)ConvertNode(typeof(T), ReadAsTree(bytes, options));
+        public T ReadAsObject<T>(FileInfo file, DecodeOptions options) => (T)ConvertNode(typeof(T), ReadAsTree(file, options));
+        public T ReadAsObject<T>(Stream stream, DecodeOptions options) => (T)ConvertNode(typeof(T), ReadAsTree(stream, options));
 
         public C ReadAsCollection<C, T>(byte[] bytes) where C : ICollection<T>, new()
             => (C)ConvertNode(typeof(C), ReadAsTree(bytes));
@@ -90,10 +113,10 @@ namespace DotnetBinaryObjectSerializer.Mapper
 
         private DefaultBinaryObjectNode NewNode() => new DefaultBinaryObjectNode(ConvertNode);
 
-        private void ReadNode(BinaryInput input, DefaultBinaryObjectNode node, int payloadLimit)
+        private void ReadNode(BinaryInput input, DefaultBinaryObjectNode node, int payloadLimit, bool terminalAncestor, DecodeOptions? options)
         {
             ReadNodeMetadata(input, node);
-            ReadNodeBody(input, node, payloadLimit);
+            ReadNodeBody(input, node, payloadLimit, terminalAncestor, options);
         }
 
         private void ReadNodeMetadata(BinaryInput input, DefaultBinaryObjectNode node)
@@ -111,7 +134,7 @@ namespace DotnetBinaryObjectSerializer.Mapper
             node.SetName(input.ReadString(nameSize));
         }
 
-        private void ReadNodeBody(BinaryInput input, DefaultBinaryObjectNode node, int payloadLimit)
+        private void ReadNodeBody(BinaryInput input, DefaultBinaryObjectNode node, int payloadLimit, bool terminalAncestor, DecodeOptions? options)
         {
             var bodySize = GetBodySize(input, node.ObjectType);
             if (bodySize < 0) throw new SerializationException("Invalid body size: " + bodySize);
@@ -122,6 +145,7 @@ namespace DotnetBinaryObjectSerializer.Mapper
                 throw new DecodeSerializationException(
                     $"Protocol corrupted: node body incomplete, expected {bodySize} bytes");
 
+            var terminal = terminalAncestor && bodyEnd == payloadLimit;
             switch (node.ObjectType)
             {
                 case ObjectType.String:
@@ -133,18 +157,55 @@ namespace DotnetBinaryObjectSerializer.Mapper
                 case ObjectType.Double:
                 case ObjectType.Float:
                 case ObjectType.Bytes:
+                case ObjectType.LargeContent:
                 case ObjectType.Null:
-                    node.SetBytesValue(input.Bytes, bodyStart, bodySize);
-                    input.Skip(bodySize);
+                    if (!input.HasBytes && terminal && node.ObjectType is ObjectType.Bytes or ObjectType.LargeContent)
+                    {
+                        node.SetStreamContent(new DeferredStreamContent(input.Source!, bodySize));
+                        input.SkipDeferred(bodySize);
+                    }
+                    else if (node.ObjectType == ObjectType.LargeContent && options?.LargeContentResolver != null)
+                    {
+                        var bytes = input.ReadBytes(bodySize);
+                        LargeContentDestination? destination = null;
+                        try
+                        {
+                            destination = options.LargeContentResolver.Resolve(new LargeContentContext(Array.Empty<string>(), node.Name, bodySize, null));
+                            destination.Output.Write(bytes, 0, bytes.Length);
+                            destination.Output.Dispose();
+                            node.SetStreamContent(destination.CompletedContent());
+                        }
+                        catch
+                        {
+                            destination?.Abort();
+                            throw;
+                        }
+                    }
+                    else if (node.ObjectType == ObjectType.Bytes && !terminal)
+                    {
+                        var bytes = input.ReadBytes(bodySize);
+                        node.SetBytesValue(bytes, 0, bytes.Length);
+                    }
+                    else if (input.HasBytes)
+                    {
+                        node.SetBytesValue(input.Bytes, bodyStart, bodySize);
+                        input.Skip(bodySize);
+                    }
+                    else
+                    {
+                        var bytes = input.ReadBytes(bodySize);
+                        node.SetBytesValue(bytes, 0, bytes.Length);
+                    }
                     break;
 
                 case ObjectType.Object:
                 case ObjectType.List:
-                    node.SetBytesValue(input.Bytes, bodyStart, bodySize);
+                    if (input.HasBytes) node.SetBytesValue(input.Bytes, bodyStart, bodySize);
+                    else node.SetBytesValue(Array.Empty<byte>(), 0, 0);
                     while (input.Position < bodyEnd)
                     {
                         var child = NewNode();
-                        ReadNode(input, child, bodyEnd);
+                        ReadNode(input, child, bodyEnd, terminal, options);
                         node.AddChild(child);
                     }
                     break;
@@ -166,6 +227,7 @@ namespace DotnetBinaryObjectSerializer.Mapper
                 case ObjectType.Object:
                 case ObjectType.List:
                 case ObjectType.Bytes:
+                case ObjectType.LargeContent:
                     return input.ReadLength();
                 case ObjectType.Null:
                     return 0;
@@ -192,6 +254,15 @@ namespace DotnetBinaryObjectSerializer.Mapper
 
             if (type == typeof(object))
                 return ConvertDynamic(node);
+
+            if (typeof(StreamContent).IsAssignableFrom(type))
+            {
+                if (node.ObjectType != ObjectType.LargeContent)
+                    throw new DecodeSerializationException($"Expected LARGE_CONTENT for {type.FullName}, got {node.ObjectType}");
+                if (type != typeof(StreamContent) && type != typeof(StreamLazy))
+                    throw new DecodeSerializationException("Only StreamContent and StreamLazy are supported for LARGE_CONTENT fields");
+                return node.AsStreamContent();
+            }
 
             if (IsSimpleType(type))
                 return ConvertSimple(type, node);
@@ -221,6 +292,7 @@ namespace DotnetBinaryObjectSerializer.Mapper
                 case ObjectType.Float: return node.AsFloat();
                 case ObjectType.Double: return node.AsDouble();
                 case ObjectType.Bytes: return node.AsBytes();
+                case ObjectType.LargeContent: return node.AsStreamContent();
                 case ObjectType.List:
                     var list = new List<object>();
                     foreach (var child in node.Children) list.Add(ConvertNode(typeof(object), child));
@@ -471,13 +543,17 @@ namespace DotnetBinaryObjectSerializer.Mapper
 
         private sealed class BinaryInput
         {
-            private readonly byte[] _bytes;
+            private readonly byte[]? _bytes;
+            private readonly Stream? _stream;
             private int _position;
             private bool _compactLengths;
 
             public BinaryInput(byte[] bytes) => _bytes = bytes;
+            public BinaryInput(Stream stream) => _stream = stream;
 
-            public byte[] Bytes => _bytes;
+            public byte[] Bytes => _bytes ?? throw new InvalidOperationException("Input is stream-backed");
+            public bool HasBytes => _bytes != null;
+            public Stream? Source => _stream;
             public int Position => _position;
 
             public void UseCompactLengths(bool compactLengths) => _compactLengths = compactLengths;
@@ -488,12 +564,16 @@ namespace DotnetBinaryObjectSerializer.Mapper
 
             public byte ReadByte()
             {
-                Require(1);
-                return _bytes[_position++];
+                if (_bytes != null) { Require(1); return _bytes[_position++]; }
+                var value = _stream!.ReadByte();
+                if (value < 0) throw new StreamEndException("Unexpected end of input");
+                _position++;
+                return (byte)value;
             }
 
             public int ReadInt()
             {
+                if (_bytes == null) return (ReadByte() << 24) | (ReadByte() << 16) | (ReadByte() << 8) | ReadByte();
                 Require(4);
                 var value = (_bytes[_position] << 24) | (_bytes[_position + 1] << 16)
                     | (_bytes[_position + 2] << 8) | _bytes[_position + 3];
@@ -503,6 +583,7 @@ namespace DotnetBinaryObjectSerializer.Mapper
 
             public long ReadLong()
             {
+                if (_bytes == null) { long streamValue = 0; for (var i = 0; i < 8; i++) streamValue = (streamValue << 8) | ReadByte(); return streamValue; }
                 Require(8);
                 long value = ((long)_bytes[_position] << 56) | ((long)_bytes[_position + 1] << 48)
                     | ((long)_bytes[_position + 2] << 40) | ((long)_bytes[_position + 3] << 32)
@@ -543,24 +624,95 @@ namespace DotnetBinaryObjectSerializer.Mapper
             public string ReadString(int length)
             {
                 if (length < 0) throw new DecodeSerializationException("Invalid string length: " + length);
-                Require(length);
-                var value = Encoding.UTF8.GetString(_bytes, _position, length);
-                _position += length;
-                return value;
+                return Encoding.UTF8.GetString(ReadBytes(length));
             }
 
             public void Skip(int length)
             {
                 if (length < 0) throw new DecodeSerializationException("Invalid skip length: " + length);
-                Require(length);
+                if (_bytes != null) { Require(length); _position += length; return; }
+                var buffer = new byte[Math.Min(64 * 1024, length)];
+                var remaining = length;
+                while (remaining > 0) { var read = _stream!.Read(buffer, 0, Math.Min(buffer.Length, remaining)); if (read == 0) throw new StreamEndException("Unexpected end of input"); remaining -= read; _position += read; }
+            }
+
+            public void SkipDeferred(int length)
+            {
+                if (_bytes != null) throw new InvalidOperationException("Only stream-backed input can be deferred");
+                if (length < 0 || _position + length < _position) throw new DecodeSerializationException("Invalid deferred length");
                 _position += length;
+            }
+
+            public byte[] ReadBytes(int length)
+            {
+                var value = new byte[length];
+                if (_bytes != null) { Require(length); Array.Copy(_bytes, _position, value, 0, length); _position += length; return value; }
+                var read = 0;
+                while (read < length) { var current = _stream!.Read(value, read, length - read); if (current == 0) throw new StreamEndException("Unexpected end of input"); read += current; _position += current; }
+                return value;
             }
 
             private void Require(int length)
             {
-                if (_position + length < _position || _position + length > _bytes.Length)
+                if (_bytes == null || _position + length < _position || _position + length > _bytes.Length)
                     throw new DecodeSerializationException("Unexpected end of input");
             }
+        }
+
+        private sealed class DeferredStreamContent : StreamContent
+        {
+            private readonly DeferredSource _deferred;
+            public DeferredStreamContent(Stream source, long length) : this(new DeferredSource(source, length)) { }
+            private DeferredStreamContent(DeferredSource deferred) : base(deferred.Length, deferred.Open, deferred.Drain) => _deferred = deferred;
+        }
+
+        private sealed class DeferredSource
+        {
+            private readonly Stream _source;
+            private long _remaining;
+            private bool _opened;
+            public DeferredSource(Stream source, long length) { _source = source; _remaining = length; Length = length; }
+            public long Length { get; }
+            public Stream Open()
+            {
+                if (_opened) throw new IOException("Deferred stream content can only be opened once");
+                _opened = true;
+                return new LimitedReadStream(_source, this);
+            }
+            public void Consume(int count) => _remaining -= count;
+            public int Read(byte[] buffer, int offset, int count)
+            {
+                if (_remaining == 0) return 0;
+                var read = _source.Read(buffer, offset, (int)Math.Min(count, _remaining));
+                if (read == 0) throw new StreamEndException("Stream ended in deferred content");
+                _remaining -= read;
+                return read;
+            }
+            public void Drain()
+            {
+                var buffer = new byte[64 * 1024];
+                while (_remaining > 0) Read(buffer, 0, buffer.Length);
+            }
+        }
+
+        private sealed class LimitedReadStream : Stream
+        {
+            private readonly Stream _source;
+            private readonly DeferredSource _state;
+            private bool _disposed;
+            public LimitedReadStream(Stream source, DeferredSource state) { _source = source; _state = state; }
+            public override bool CanRead => !_disposed && _source.CanRead;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => throw new NotSupportedException();
+            public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+            public override int Read(byte[] buffer, int offset, int count) { if (_disposed) throw new ObjectDisposedException(nameof(LimitedReadStream)); return _state.Read(buffer, offset, count); }
+            public override int Read(Span<byte> buffer) { var copy = new byte[buffer.Length]; var read = Read(copy, 0, copy.Length); copy.AsSpan(0, read).CopyTo(buffer); return read; }
+            public override void Flush() { }
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+            public override void SetLength(long value) => throw new NotSupportedException();
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+            protected override void Dispose(bool disposing) { if (disposing && !_disposed) { _disposed = true; _state.Drain(); } base.Dispose(disposing); }
         }
     }
 }

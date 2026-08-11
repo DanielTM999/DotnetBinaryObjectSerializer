@@ -13,6 +13,7 @@ namespace DotnetBinaryObjectSerializer.Enums
         Object = 0x09,
         Bytes = 0x10,
         List = 0x11,
-        Null = 0x12
+        Null = 0x12,
+        LargeContent = 0x13
     }
 }
