@@ -9,7 +9,7 @@ namespace DotnetBinaryObjectSerializer
 
         protected StreamContent(long length, Func<Stream> source, Action? cleanup = null)
         {
-            if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+            ArgumentOutOfRangeException.ThrowIfNegative(length);
             Length = length;
             _source = source ?? throw new ArgumentNullException(nameof(source));
             _cleanup = cleanup ?? (() => { });

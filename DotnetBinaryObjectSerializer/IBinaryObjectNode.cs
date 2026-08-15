@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using DotnetBinaryObjectSerializer.Enums;
 
 namespace DotnetBinaryObjectSerializer
